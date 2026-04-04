@@ -1,4 +1,3 @@
-// presence-server/server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -13,20 +12,15 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 5e6 // 5MB for screen frames
+  maxHttpBufferSize: 10e6
 });
 
-// In-memory store for pairing rooms
-// In production, use Redis
 const rooms = new Map();
-// roomId -> { hostSocketId, viewerSocketId, token, createdAt, mood }
 
-// Generate a secure room token
 function generateToken() {
-  return crypto.randomBytes(16).toString('hex'); // 32 char hex
+  return crypto.randomBytes(16).toString('hex');
 }
 
-// REST: Phone B calls this to create a room and get a pairing token
 app.post('/create-room', (req, res) => {
   const token = generateToken();
   const roomId = generateToken();
@@ -38,18 +32,15 @@ app.post('/create-room', (req, res) => {
     createdAt: Date.now(),
     mood: req.body.mood || ''
   });
-  // Token expires in 10 minutes
   setTimeout(() => {
     const room = rooms.get(roomId);
     if (room && !room.viewerSocketId) {
       rooms.delete(roomId);
     }
   }, 10 * 60 * 1000);
-
   res.json({ roomId, token });
 });
 
-// REST: Phone A uses this to validate the token before connecting
 app.post('/validate-token', (req, res) => {
   const { roomId, token } = req.body;
   const room = rooms.get(roomId);
@@ -63,7 +54,6 @@ app.post('/validate-token', (req, res) => {
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
-  // Phone B (host) joins their room
   socket.on('host:join', ({ roomId, token }) => {
     const room = rooms.get(roomId);
     if (!room || room.token !== token) {
@@ -77,7 +67,6 @@ io.on('connection', (socket) => {
     console.log(`Host joined room ${roomId}`);
   });
 
-  // Phone A (viewer) joins the room
   socket.on('viewer:join', ({ roomId, token }) => {
     const room = rooms.get(roomId);
     if (!room || room.token !== token) {
@@ -88,47 +77,46 @@ io.on('connection', (socket) => {
     socket.join(roomId);
     socket.roomId = roomId;
     socket.role = 'viewer';
-    // Notify host that viewer has connected
     socket.to(roomId).emit('viewer:connected');
     console.log(`Viewer joined room ${roomId}`);
   });
 
-  // Host sends a screen frame (JPEG bytes as base64)
+  // Bidirectional — any role can send frames, relayed to the other person
   socket.on('frame', (data) => {
-    if (socket.role !== 'host') return;
+    if (!socket.roomId) return;
     socket.to(socket.roomId).emit('frame', data);
   });
 
-  // Viewer requests remote control
+  // Bidirectional control request — anyone can request control
   socket.on('control:request', () => {
-    if (socket.role !== 'viewer') return;
+    if (!socket.roomId) return;
     socket.to(socket.roomId).emit('control:request');
   });
 
-  // Host approves or denies control
+  // Bidirectional control response
   socket.on('control:response', (approved) => {
-    if (socket.role !== 'host') return;
+    if (!socket.roomId) return;
     socket.to(socket.roomId).emit('control:response', approved);
   });
 
-  // Viewer sends a touch event to host
+  // Bidirectional touch events
   socket.on('touch:event', (data) => {
-    if (socket.role !== 'viewer') return;
+    if (!socket.roomId) return;
     socket.to(socket.roomId).emit('touch:event', data);
   });
 
-  // Heartbeat pulse (viewer sends vibration to host)
+  // Bidirectional heartbeat
   socket.on('heartbeat:pulse', () => {
-    if (socket.role !== 'viewer') return;
+    if (!socket.roomId) return;
     socket.to(socket.roomId).emit('heartbeat:pulse');
   });
 
-  // Mood update
+  // Bidirectional mood
   socket.on('mood:update', (mood) => {
+    if (!socket.roomId) return;
     socket.to(socket.roomId).emit('mood:update', mood);
   });
 
-  // Either side drops the connection
   socket.on('drop:connection', () => {
     const roomId = socket.roomId;
     if (roomId) {
@@ -138,7 +126,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle disconnects gracefully
   socket.on('disconnect', () => {
     if (socket.roomId) {
       socket.to(socket.roomId).emit('peer:disconnected');
