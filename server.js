@@ -21,113 +21,113 @@ function generateToken() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+// Device A calls this to create a room
 app.post('/create-room', (req, res) => {
   const token = generateToken();
   const roomId = generateToken();
   rooms.set(roomId, {
-    hostSocketId: null,
-    viewerSocketId: null,
+    members: [], // max 2 members
     token,
     roomId,
     createdAt: Date.now(),
     mood: req.body.mood || ''
   });
+  // Room expires in 10 minutes if second person never joins
   setTimeout(() => {
     const room = rooms.get(roomId);
-    if (room && !room.viewerSocketId) {
+    if (room && room.members.length < 2) {
       rooms.delete(roomId);
+      console.log(`Room ${roomId} expired`);
     }
   }, 10 * 60 * 1000);
-  res.json({ roomId, token });
-});
 
-app.post('/validate-token', (req, res) => {
-  const { roomId, token } = req.body;
-  const room = rooms.get(roomId);
-  if (room && room.token === token) {
-    res.json({ valid: true, mood: room.mood });
-  } else {
-    res.json({ valid: false });
-  }
+  console.log(`Room created: ${roomId}`);
+  res.json({ roomId, token });
 });
 
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
-  socket.on('host:join', ({ roomId, token }) => {
+  // Both devices use the same join event — no host/viewer distinction
+  socket.on('room:join', ({ roomId, token }) => {
     const room = rooms.get(roomId);
-    if (!room || room.token !== token) {
-      socket.emit('error', 'Invalid token');
+    if (!room) {
+      socket.emit('room:error', 'Room not found or expired');
       return;
     }
-    room.hostSocketId = socket.id;
-    socket.join(roomId);
-    socket.roomId = roomId;
-    socket.role = 'host';
-    console.log(`Host joined room ${roomId}`);
-  });
-
-  socket.on('viewer:join', ({ roomId, token }) => {
-    const room = rooms.get(roomId);
-    if (!room || room.token !== token) {
-      socket.emit('error', 'Invalid token');
+    if (room.token !== token) {
+      socket.emit('room:error', 'Invalid token');
       return;
     }
-    room.viewerSocketId = socket.id;
+    if (room.members.length >= 2) {
+      socket.emit('room:error', 'Room is full');
+      return;
+    }
+
+    room.members.push(socket.id);
     socket.join(roomId);
     socket.roomId = roomId;
-    socket.role = 'viewer';
-    socket.to(roomId).emit('viewer:connected');
-    console.log(`Viewer joined room ${roomId}`);
+    console.log(`Socket ${socket.id} joined room ${roomId} (${room.members.length}/2)`);
+
+    // Tell this socket they joined successfully
+    socket.emit('room:joined', { memberCount: room.members.length });
+
+    // If both people are now in the room, tell both to start
+    if (room.members.length === 2) {
+      console.log(`Room ${roomId} is full — notifying both members`);
+      io.to(roomId).emit('room:ready');
+    }
   });
 
-  // Bidirectional — any role can send frames, relayed to the other person
+  // Relay screen frames to the other person — no role check
   socket.on('frame', (data) => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('frame', data);
   });
 
-  // Bidirectional control request — anyone can request control
+  // Relay everything else bidirectionally
   socket.on('control:request', () => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('control:request');
   });
 
-  // Bidirectional control response
   socket.on('control:response', (approved) => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('control:response', approved);
   });
 
-  // Bidirectional touch events
   socket.on('touch:event', (data) => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('touch:event', data);
   });
 
-  // Bidirectional heartbeat
   socket.on('heartbeat:pulse', () => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('heartbeat:pulse');
   });
 
-  // Bidirectional mood
   socket.on('mood:update', (mood) => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('mood:update', mood);
   });
 
+  // Either person can drop the connection for both
   socket.on('drop:connection', () => {
     const roomId = socket.roomId;
     if (roomId) {
       socket.to(roomId).emit('connection:dropped');
       rooms.delete(roomId);
       io.socketsLeave(roomId);
+      console.log(`Room ${roomId} dropped`);
     }
   });
 
   socket.on('disconnect', () => {
     if (socket.roomId) {
+      const room = rooms.get(socket.roomId);
+      if (room) {
+        room.members = room.members.filter(id => id !== socket.id);
+      }
       socket.to(socket.roomId).emit('peer:disconnected');
     }
     console.log('Socket disconnected:', socket.id);
