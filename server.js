@@ -15,29 +15,37 @@ const io = new Server(server, {
   maxHttpBufferSize: 10e6
 });
 
+// Room structure:
+// roomId -> {
+//   token, createdAt, mood,
+//   members: { socketId: { deviceId, online } },
+//   shareState: { sharerId, viewerId } | null
+// }
 const rooms = new Map();
 
-function generateToken() {
+function generateId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
-// Device A calls this to create a room
+// Create a new pairing room
 app.post('/create-room', (req, res) => {
-  const token = generateToken();
-  const roomId = generateToken();
+  const token = generateId();
+  const roomId = generateId();
   rooms.set(roomId, {
-    members: [], // max 2 members
     token,
     roomId,
     createdAt: Date.now(),
-    mood: req.body.mood || ''
+    mood: req.body.mood || '',
+    members: {},
+    shareState: null
   });
-  // Room expires in 10 minutes if second person never joins
+
+  // Expire unpaired rooms after 10 minutes
   setTimeout(() => {
     const room = rooms.get(roomId);
-    if (room && room.members.length < 2) {
+    if (room && Object.keys(room.members).length < 2) {
       rooms.delete(roomId);
-      console.log(`Room ${roomId} expired`);
+      console.log(`Room ${roomId} expired unpaired`);
     }
   }, 10 * 60 * 1000);
 
@@ -45,11 +53,16 @@ app.post('/create-room', (req, res) => {
   res.json({ roomId, token });
 });
 
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', rooms: rooms.size });
+});
+
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
-  // Both devices use the same join event — no host/viewer distinction
-  socket.on('room:join', ({ roomId, token }) => {
+  // Both devices join using same event
+  socket.on('room:join', ({ roomId, token, deviceId }) => {
     const room = rooms.get(roomId);
     if (!room) {
       socket.emit('room:error', 'Room not found or expired');
@@ -59,33 +72,108 @@ io.on('connection', (socket) => {
       socket.emit('room:error', 'Invalid token');
       return;
     }
-    if (room.members.length >= 2) {
+    if (Object.keys(room.members).length >= 2 &&
+        !Object.values(room.members).find(m => m.deviceId === deviceId)) {
       socket.emit('room:error', 'Room is full');
       return;
     }
 
-    room.members.push(socket.id);
+    // Remove old socket for this device if reconnecting
+    const existingMember = Object.entries(room.members)
+      .find(([, m]) => m.deviceId === deviceId);
+    if (existingMember) {
+      delete room.members[existingMember[0]];
+    }
+
+    room.members[socket.id] = { deviceId, online: true };
     socket.join(roomId);
     socket.roomId = roomId;
-    console.log(`Socket ${socket.id} joined room ${roomId} (${room.members.length}/2)`);
+    socket.deviceId = deviceId;
 
-    // Tell this socket they joined successfully
-    socket.emit('room:joined', { memberCount: room.members.length });
+    const memberCount = Object.keys(room.members).length;
+    console.log(`Device ${deviceId} joined room ${roomId} (${memberCount}/2)`);
 
-    // If both people are now in the room, tell both to start
-    if (room.members.length === 2) {
-      console.log(`Room ${roomId} is full — notifying both members`);
-      io.to(roomId).emit('room:ready');
+    socket.emit('room:joined', {
+      memberCount,
+      shareState: room.shareState
+    });
+
+    // Tell everyone current state
+    if (memberCount === 2) {
+      io.to(roomId).emit('room:ready', {
+        shareState: room.shareState
+      });
     }
+
+    // Tell partner this device came online
+    socket.to(roomId).emit('partner:online');
   });
 
-  // Relay screen frames to the other person — no role check
-  socket.on('frame', (data) => {
+  // Device A requests to see Device B's screen
+  socket.on('share:request', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+    // Forward request to partner
+    socket.to(socket.roomId).emit('share:requested', {
+      fromDeviceId: socket.deviceId
+    });
+    console.log(`Share requested in room ${socket.roomId}`);
+  });
+
+  // Device B approves the request
+  socket.on('share:approve', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+    // B is the sharer, the other member is the viewer
+    room.shareState = {
+      sharerId: socket.deviceId,
+      sharerSocketId: socket.id
+    };
+    // Tell both devices sharing is now active
+    io.to(socket.roomId).emit('share:started', {
+      sharerId: socket.deviceId
+    });
+    console.log(`Share approved in room ${socket.roomId}`);
+  });
+
+  // Device B declines the request
+  socket.on('share:decline', ({ message }) => {
+    socket.to(socket.roomId).emit('share:declined', { message });
+  });
+
+  // Device B starts sharing proactively
+  socket.on('share:start', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+    room.shareState = {
+      sharerId: socket.deviceId,
+      sharerSocketId: socket.id
+    };
+    // Notify partner that B is sharing
+    socket.to(socket.roomId).emit('share:partnerStarted', {
+      sharerId: socket.deviceId
+    });
+    socket.emit('share:started', { sharerId: socket.deviceId });
+    console.log(`Share started proactively in room ${socket.roomId}`);
+  });
+
+  // Device B stops sharing
+  socket.on('share:stop', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+    room.shareState = null;
+    // Tell both devices sharing has stopped
+    io.to(socket.roomId).emit('share:stopped');
+    console.log(`Share stopped in room ${socket.roomId}`);
+  });
+
+  // Relay screen frames — only from active sharer
+  socket.on('frame', (base64) => {
     if (!socket.roomId) return;
-    socket.to(socket.roomId).emit('frame', data);
+    socket.to(socket.roomId).emit('frame', base64);
   });
 
-  // Relay everything else bidirectionally
+  // Control request
   socket.on('control:request', () => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('control:request');
@@ -101,24 +189,30 @@ io.on('connection', (socket) => {
     socket.to(socket.roomId).emit('touch:event', data);
   });
 
+  // Heartbeat — works anytime
   socket.on('heartbeat:pulse', () => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('heartbeat:pulse');
   });
 
+  // Mood update
   socket.on('mood:update', (mood) => {
-    if (!socket.roomId) return;
-    socket.to(socket.roomId).emit('mood:update', mood);
+    const room = rooms.get(socket.roomId);
+    if (room) room.mood = mood;
+    socket.to(socket.roomId).emit('mood:update', {
+      mood,
+      fromDeviceId: socket.deviceId
+    });
   });
 
-  // Either person can drop the connection for both
-  socket.on('drop:connection', () => {
+  // Unpair — removes the room entirely
+  socket.on('room:unpair', () => {
     const roomId = socket.roomId;
     if (roomId) {
-      socket.to(roomId).emit('connection:dropped');
+      socket.to(roomId).emit('room:unpaired');
       rooms.delete(roomId);
       io.socketsLeave(roomId);
-      console.log(`Room ${roomId} dropped`);
+      console.log(`Room ${roomId} unpaired`);
     }
   });
 
@@ -126,9 +220,9 @@ io.on('connection', (socket) => {
     if (socket.roomId) {
       const room = rooms.get(socket.roomId);
       if (room) {
-        room.members = room.members.filter(id => id !== socket.id);
+        delete room.members[socket.id];
       }
-      socket.to(socket.roomId).emit('peer:disconnected');
+      socket.to(socket.roomId).emit('partner:offline');
     }
     console.log('Socket disconnected:', socket.id);
   });
