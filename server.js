@@ -113,7 +113,6 @@ io.on('connection', (socket) => {
   socket.on('share:request', () => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    // Forward request to partner
     socket.to(socket.roomId).emit('share:requested', {
       fromDeviceId: socket.deviceId
     });
@@ -124,12 +123,10 @@ io.on('connection', (socket) => {
   socket.on('share:approve', () => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    // B is the sharer, the other member is the viewer
     room.shareState = {
       sharerId: socket.deviceId,
       sharerSocketId: socket.id
     };
-    // Tell both devices sharing is now active
     io.to(socket.roomId).emit('share:started', {
       sharerId: socket.deviceId
     });
@@ -149,7 +146,6 @@ io.on('connection', (socket) => {
       sharerId: socket.deviceId,
       sharerSocketId: socket.id
     };
-    // Notify partner that B is sharing
     socket.to(socket.roomId).emit('share:partnerStarted', {
       sharerId: socket.deviceId
     });
@@ -162,7 +158,6 @@ io.on('connection', (socket) => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
     room.shareState = null;
-    // Tell both devices sharing has stopped
     io.to(socket.roomId).emit('share:stopped');
     console.log(`Share stopped in room ${socket.roomId}`);
   });
@@ -204,6 +199,38 @@ io.on('connection', (socket) => {
       fromDeviceId: socket.deviceId
     });
   });
+
+  // ================= CHAT FEATURES ADDED =================
+
+  // Chat messages — only relay when no active share
+  socket.on('chat:message', (data) => {
+    if (!socket.roomId) return;
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+
+    if (room.shareState) {
+      socket.emit('chat:blocked', 'chat unavailable during screen share');
+      return;
+    }
+
+    io.to(socket.roomId).emit('chat:message', {
+      text: data.text,
+      fromDeviceId: socket.deviceId,
+      timestamp: Date.now(),
+      id: crypto.randomBytes(8).toString('hex')
+    });
+  });
+
+  // Typing indicator
+  socket.on('chat:typing', (isTyping) => {
+    if (!socket.roomId) return;
+    socket.to(socket.roomId).emit('chat:typing', {
+      isTyping,
+      fromDeviceId: socket.deviceId
+    });
+  });
+
+  // ======================================================
 
   // Unpair — removes the room entirely
   socket.on('room:unpair', () => {
